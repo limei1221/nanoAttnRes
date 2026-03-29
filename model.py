@@ -26,6 +26,40 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RMSNorm(nn.Module):
+    """ RMSNorm used as the key normalizer inside block_attn_res. """
+
+    def __init__(self, ndim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return self.weight * x / rms
+
+def block_attn_res(blocks, partial, proj, norm):
+    """Depth-wise attention over past block summaries and the current partial residual.
+
+    Implements the Block AttnRes mechanism from "Attention Residuals" (Moonshot AI, 2026).
+    Each past block summary and `partial` become Values; a learned pseudo-query vector
+    (proj.weight) scores them after RMSNorm, and the softmax-weighted sum replaces the
+    raw residual as input to the next sublayer.
+
+    Args:
+        blocks: list of N tensors (B, T, C) — accumulated block-boundary snapshots.
+        partial: (B, T, C) — current partial residual within the active block.
+        proj: nn.Linear(C, 1, bias=False) — pseudo-query; weight shape (1, C).
+        norm: RMSNorm(C) — normalises values to form keys.
+    Returns:
+        h: (B, T, C) — attended combination to feed into the sublayer's LayerNorm.
+    """
+    V = torch.stack(blocks + [partial], dim=0)              # (N+1, B, T, C)
+    K = norm(V)                                              # (N+1, B, T, C)
+    logits = torch.einsum('c,nbtc->nbt', proj.weight[0], K) # (N+1, B, T)
+    weights = logits.softmax(dim=0)                         # (N+1, B, T)
+    return torch.einsum('nbt,nbtc->btc', weights, V)        # (B, T, C)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -93,17 +127,52 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=0):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        self.layer_idx = layer_idx
+        self.config = config
+        if config.n_attn_res_blocks > 0:
+            # Pseudo-query vectors (one per sublayer); zeroed after _init_weights
+            self.attn_res_proj = nn.Linear(config.n_embd, 1, bias=False)
+            self.attn_res_norm = RMSNorm(config.n_embd)
+            self.mlp_res_proj  = nn.Linear(config.n_embd, 1, bias=False)
+            self.mlp_res_norm  = RMSNorm(config.n_embd)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, x, blocks=None):
+        if not self.config.n_attn_res_blocks:
+            # Standard pre-norm residual path
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x, blocks
+
+        partial = x
+        n_sublayers = 2 * self.config.n_layer
+        sublayers_per_block = n_sublayers // self.config.n_attn_res_blocks
+
+        def is_block_boundary(sublayer_idx):
+            # Fire before this sublayer if it starts a new block.
+            # sublayer_idx=0 fires intentionally: captures token embedding as b0.
+            return sublayer_idx % sublayers_per_block == 0
+
+        # --- depth-wise attention before self-attention sublayer ---
+        h = block_attn_res(blocks, partial, self.attn_res_proj, self.attn_res_norm)
+        if is_block_boundary(2 * self.layer_idx):
+            blocks = blocks + [partial]
+            partial = torch.zeros_like(partial)
+        partial = partial + self.attn(self.ln_1(h))
+
+        # --- depth-wise attention before MLP sublayer ---
+        h = block_attn_res(blocks, partial, self.mlp_res_proj, self.mlp_res_norm)
+        if is_block_boundary(2 * self.layer_idx + 1):
+            blocks = blocks + [partial]
+            partial = torch.zeros_like(partial)
+        partial = partial + self.mlp(self.ln_2(h))
+
+        return partial, blocks
 
 @dataclass
 class GPTConfig:
@@ -114,6 +183,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    n_attn_res_blocks: int = 0 # Block AttnRes (Moonshot AI, 2026): number of depth blocks.
+                               # 0 = disabled (standard nanoGPT). Recommended: n_layer // 3.
 
 class GPT(nn.Module):
 
@@ -121,13 +192,15 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        assert config.n_attn_res_blocks == 0 or (2 * config.n_layer) % config.n_attn_res_blocks == 0, \
+            f"2 * n_layer ({2 * config.n_layer}) must be divisible by n_attn_res_blocks ({config.n_attn_res_blocks})"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -143,6 +216,12 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # AttnRes pseudo-query vectors must start at zero so softmax begins uniform,
+        # matching a standard residual at initialisation (re-zero after _init_weights).
+        if config.n_attn_res_blocks > 0:
+            for pn, p in self.named_parameters():
+                if pn.endswith(('attn_res_proj.weight', 'mlp_res_proj.weight')):
+                    torch.nn.init.zeros_(p)
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -177,8 +256,9 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        blocks = []  # depth-wise block summaries for Block AttnRes (empty when disabled)
         for block in self.transformer.h:
-            x = block(x)
+            x, blocks = block(x, blocks)
         x = self.transformer.ln_f(x)
 
         if targets is not None:

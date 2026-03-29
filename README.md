@@ -1,8 +1,9 @@
 
-# nanoGPT
+# nanoAttnRes
 
-![nanoGPT](assets/nanogpt.jpg)
+<!-- ![nanoGPT](assets/nanogpt.jpg) -->
 
+**nanoAttnRes** is a fork of [nanoGPT](https://github.com/karpathy/nanoGPT) that adds the **Block Attention Residuals** mechanism from Moonshot AI's [Attention Residuals paper (arXiv 2603.15031)](https://arxiv.org/abs/2603.15031). Everything else — training, finetuning, sampling, DDP — is identical to nanoGPT.
 
 ---
 
@@ -207,6 +208,36 @@ If you'd like to sample from a model you trained, use the `--out_dir` to point t
 For simple model benchmarking and profiling, `bench.py` might be useful. It's identical to what happens in the meat of the training loop of `train.py`, but omits much of the other complexities.
 
 Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started/pytorch-2.0/). At the time of writing (Dec 29, 2022) this makes `torch.compile()` available in the nightly release. The improvement from the one line of code is noticeable, e.g. cutting down iteration time from ~250ms / iter to 135ms / iter. Nice work PyTorch team!
+
+## Block Attention Residuals
+
+This fork adds the **Block AttnRes** mechanism from [Attention Residuals (Moonshot AI, arXiv 2603.15031)](https://arxiv.org/abs/2603.15031). Enable it with `n_attn_res_blocks` in your config or as a CLI flag:
+
+```python
+# config/train_shakespeare_char.py
+n_attn_res_blocks = 2
+```
+
+`n_attn_res_blocks` controls how many depth-wise blocks the layers are divided into:
+
+| value | behaviour |
+|-------|-----------|
+| `0` (default) | standard nanoGPT, no change |
+| `1`…`n_layer` | Block AttnRes — layers grouped into N blocks; each sublayer attends over past block summaries plus the current partial residual |
+| `2 * n_layer` | Full AttnRes — every sublayer output is snapshotted; maximum expressivity |
+
+The token embedding is always included as `b0`, the first entry every layer can attend to.
+
+**Constraint:** `(2 * n_layer) % n_attn_res_blocks == 0` must hold.
+
+### Metrics
+
+Each eval step now reports two loss metrics:
+
+- **val loss** — standard cross-entropy loss in nats
+- **val bpb** — bits per byte; computed from actual token→byte lengths (char-level via `meta.pkl`, BPE via tiktoken). Tokenizer-agnostic, useful for comparing across tokenizations.
+
+Both are logged to wandb under `val/loss`, `val/bpb`. Average step time is logged as `dt` (ms).
 
 ## todos
 

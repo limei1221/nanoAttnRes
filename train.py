@@ -54,6 +54,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+n_attn_res_blocks = 4 # Block AttnRes (Attention Residuals, https://arxiv.org/abs/2603.15031), 0: Standard Attention, 2 * n_layer: full Attention Residuals, requires 2 * n_layer % n_attn_res_blocks == 0, AttnRes treat each sublayer (1 Attention + 1 MLP) as 2 layers
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -143,9 +144,27 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
+# build a token_id -> byte_length lookup for val_bpb computation
+token_byte_lens = None
+if meta_vocab_size is not None and 'itos' in meta:
+    # char-level dataset: each token is a character; measure its UTF-8 byte length
+    itos = meta['itos']
+    _lens = [len(itos[i].encode('utf-8')) for i in range(meta_vocab_size)]
+    token_byte_lens = torch.tensor(_lens, dtype=torch.long)
+else:
+    # BPE dataset: use tiktoken to get byte length per token
+    try:
+        import tiktoken
+        _enc = tiktoken.get_encoding('gpt2')
+        _lens = [len(_enc.decode_single_token_bytes(i)) for i in range(_enc.n_vocab)]
+        token_byte_lens = torch.tensor(_lens, dtype=torch.long)
+    except Exception:
+        pass  # val_bpb will not be reported
+
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  n_attn_res_blocks=n_attn_res_blocks) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -163,7 +182,7 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'n_attn_res_blocks']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -184,7 +203,7 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'n_attn_res_blocks']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
@@ -218,12 +237,23 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        if split == 'val' and token_byte_lens is not None:
+            _byte_lens = token_byte_lens.to(device)
+            total_tokens = 0
+            total_bytes = 0
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
+            if split == 'val' and token_byte_lens is not None:
+                total_tokens += Y.numel()
+                total_bytes += _byte_lens[Y].sum().item()
         out[split] = losses.mean()
+        if split == 'val' and token_byte_lens is not None:
+            bits_per_token = out['val'].item() / math.log(2.0)
+            tokens_per_byte = total_tokens / total_bytes
+            out['val_bpb'] = bits_per_token * tokens_per_byte
     model.train()
     return out
 
@@ -252,6 +282,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+running_dt = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
@@ -262,15 +293,21 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        val_bpb = losses.get('val_bpb')
+        bpb_str = f", val bpb {val_bpb:.4f}" if val_bpb is not None else ""
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}{bpb_str}")
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+                "dt": running_dt*1000, # avg step time in ms
+            }
+            if val_bpb is not None:
+                log_dict["val/bpb"] = val_bpb
+            wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -324,6 +361,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            running_dt = dt if running_dt == -1.0 else 0.9*running_dt + 0.1*dt
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
