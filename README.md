@@ -11,7 +11,7 @@ pip install torch numpy transformers datasets tiktoken wandb tqdm
 ## quick start
 
 ```sh
-python data/shakespeare_char/prepare.py
+python data/shakespeare_char/prepare.py   # char-level Shakespeare
 python train.py config/train_shakespeare_char.py
 python sample.py --out_dir=out-shakespeare-char
 ```
@@ -19,6 +19,9 @@ python sample.py --out_dir=out-shakespeare-char
 ## training
 
 ```sh
+# prepare data
+python data/openwebtext/prepare.py        # OpenWebText (54GB, ~hours)
+
 # GPT-2 (124M) on OpenWebText — 8x A100, ~4 days, val loss ~2.85
 torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
