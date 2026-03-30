@@ -20,6 +20,7 @@ python sample.py --out_dir=out-shakespeare-char
 
 ```sh
 # prepare data
+python data/shakespeare/prepare.py        # BPE Shakespeare (for GPT-2 finetuning)
 python data/openwebtext/prepare.py        # OpenWebText (54GB, ~hours)
 
 # GPT-2 (124M) on OpenWebText — 8x A100, ~4 days, val loss ~2.85
@@ -38,7 +39,7 @@ python sample.py --out_dir=out
 python sample.py --init_from=gpt2-xl --start="Once upon a time"
 ```
 
-## Block Attention Residuals
+## Attention Residuals
 
 Set `n_attn_res_blocks` to enable AttnRes:
 
