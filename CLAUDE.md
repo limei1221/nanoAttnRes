@@ -60,6 +60,17 @@ python bench.py                   # timing benchmark
 python bench.py --profile=True    # PyTorch profiler output
 ```
 
+### Comparison Experiments (run.sh)
+
+`run.sh` auto-detects GPU and runs baseline vs Block AttnRes vs Full AttnRes:
+```bash
+bash run.sh
+```
+- **No GPU**: Shakespeare char, CPU, 3 runs (~minutes each)
+- **GPU**: OpenWebText GPT-2 124M, 1×A100, 3 runs (~1 hour each)
+
+All runs log to wandb by default (`wandb_log=True` is set in the script).
+
 ## Configuration System
 
 `configurator.py` implements a "poor man's configurator": scripts define defaults as module-level variables, then `configurator.py` is exec'd to override them via config files or `--key=value` CLI flags. This means:
@@ -74,8 +85,12 @@ Set `n_attn_res_blocks` in `GPTConfig` (or as a CLI/config-file override) to ena
 
 ```python
 # config/train_shakespeare_char.py
-n_attn_res_blocks = 2  # recommended: n_layer // 3
+n_attn_res_blocks = 4  # must satisfy: (2 * n_layer) % n_attn_res_blocks == 0
 ```
+
+**Variants:**
+- **Block AttnRes**: `n_attn_res_blocks` divides `2 * n_layer` evenly; e.g. `n_attn_res_blocks=4` with `n_layer=12` gives 4 blocks of 6 sublayers each.
+- **Full AttnRes**: `n_attn_res_blocks = 2 * n_layer` — snapshot at every sublayer boundary.
 
 **What it does.** Replaces the standard `x = x + sublayer(LN(x))` with depth-wise attention. Before each sublayer (attention and MLP), a learned pseudo-query vector scores all *past block summaries* plus the *current partial residual* via softmax; the model uses that weighted combination as the sublayer's input instead of raw `x`. At block boundaries, the partial residual is snapshotted into the `blocks` list and reset to zero, bounding hidden-state magnitude growth.
 
@@ -83,10 +98,11 @@ n_attn_res_blocks = 2  # recommended: n_layer // 3
 - `attn_res_proj` / `mlp_res_proj`: `Linear(n_embd, 1, bias=False)` — the pseudo-query; **zero-initialized**
 - `attn_res_norm` / `mlp_res_norm`: `RMSNorm(n_embd)` — normalises the stacked values to form keys
 
-**Boundary schedule** (0-indexed layers):
-- `layers_per_block = n_layer // n_attn_res_blocks`
-- A snapshot fires at every layer `i` where `(i+1) % layers_per_block == 0` and `i+1 < n_layer`
-- Example: `n_layer=6, n_attn_res_blocks=3` → boundaries after layers 1 and 3
+**Boundary schedule** (sublayer-level, 0-indexed):
+- Each transformer layer has 2 sublayers (attn=even, mlp=odd). Total sublayers = `2 * n_layer`.
+- `sublayers_per_block = (2 * n_layer) // n_attn_res_blocks`
+- A snapshot fires at sublayer `s` where `s % sublayers_per_block == 0`
+- Example: `n_layer=6, n_attn_res_blocks=3` → `sublayers_per_block=4`, snapshots at sublayer 0 (layer 0 attn), 4 (layer 2 attn), 8 (layer 4 attn)
 
 **Gradient behaviour at init.** Pseudo-query weights start at zero → all logits = 0 → softmax is uniform. When the stack has only 1 item (early layers where `blocks` is still empty), the Jacobian of softmax is zero, so those weights receive no gradient until a second item enters the stack. This is expected and correct.
 
@@ -122,6 +138,7 @@ Key design choices:
 - **DDP**: wraps model with `DistributedDataParallel`; syncs gradients only at the final accumulation step (`no_sync` context otherwise).
 - **Mixed precision**: `bfloat16` preferred on Ampere+; `float16` with `GradScaler` on older hardware.
 - **Checkpointing**: saves to `out_dir/ckpt.pt` on best val loss; resumes with `init_from='resume'`.
+- **`val_bpb`**: bits-per-byte metric computed alongside val loss and logged to wandb as `val/bpb`. Requires `tiktoken` for BPE datasets or `meta.pkl` with `itos` for char-level datasets; silently skipped otherwise.
 - **Compilation**: `torch.compile(model)` is on by default (`compile=True`); disable with `--compile=False` on older PyTorch or for debugging.
 
 ### Data Pipeline
